@@ -59,7 +59,19 @@ tags
 /abc
 
 /arch_flags
+/i10.aig
 
 /cmake
 /cscope
 abc.history
+
+claude_doc/
+claude_run/
+claude_scripts/
+codex_doc/
+install/
+tc_public/
+contest.pdf
+.claude/
+CLAUDE.md
+CODEX.md

@@ -66,6 +66,7 @@
 #include "base/acb/acbPar.h"
 #include "misc/extra/extra.h"
 #include "opt/eslim/eSLIM.h"
+#include "opt/moshare/moshare.h"
 
 
 #ifndef _WIN32
@@ -668,7 +669,8 @@ static int Abc_CommandAbc9Regio              ( Abc_Frame_t * pAbc, int argc, cha
 static int Abc_CommandAbc9Test               ( Abc_Frame_t * pAbc, int argc, char ** argv );
 
 static int Abc_CommandAbc9eSLIM              ( Abc_Frame_t * pAbc, int argc, char ** argv );
-static int Abc_CommandAbc9elSLIM             ( Abc_Frame_t * pAbc, int argc, char ** argv );
+	static int Abc_CommandAbc9elSLIM             ( Abc_Frame_t * pAbc, int argc, char ** argv );
+	static int Abc_CommandMoshare                ( Abc_Frame_t * pAbc, int argc, char ** argv );
 
 static int Abc_CommandAbc9CatBtor            ( Abc_Frame_t * pAbc, int argc, char ** argv );
 
@@ -1468,6 +1470,8 @@ void Abc_Init( Abc_Frame_t * pAbc )
 //    Cmd_CommandAdd( pAbc, "ABC9",         "&cexcut",       Abc_CommandAbc9CexCut,       0 );
 //    Cmd_CommandAdd( pAbc, "ABC9",         "&cexmerge",     Abc_CommandAbc9CexMerge,     0 );
 //    Cmd_CommandAdd( pAbc, "ABC9",         "&cexmin",       Abc_CommandAbc9CexMin,       0 );
+
+    Cmd_CommandAdd( pAbc, "ABC9",         "moshare",       Abc_CommandMoshare,         0 );
 
     Cmd_CommandAdd( pAbc, "Abstraction",  "&abs_create",   Abc_CommandAbc9AbsCreate,    0 );
     Cmd_CommandAdd( pAbc, "Abstraction",  "&abs_derive",   Abc_CommandAbc9AbsDerive,    0 );
