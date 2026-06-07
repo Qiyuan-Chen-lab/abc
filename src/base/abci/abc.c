@@ -670,7 +670,7 @@ static int Abc_CommandAbc9Test               ( Abc_Frame_t * pAbc, int argc, cha
 
 static int Abc_CommandAbc9eSLIM              ( Abc_Frame_t * pAbc, int argc, char ** argv );
 	static int Abc_CommandAbc9elSLIM             ( Abc_Frame_t * pAbc, int argc, char ** argv );
-	static int Abc_CommandMoshare                ( Abc_Frame_t * pAbc, int argc, char ** argv );
+	int Abc_CommandMoshare                ( Abc_Frame_t * pAbc, int argc, char ** argv );
 
 static int Abc_CommandAbc9CatBtor            ( Abc_Frame_t * pAbc, int argc, char ** argv );
 

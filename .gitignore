@@ -65,10 +65,8 @@ tags
 /cscope
 abc.history
 
-claude_doc/
 claude_run/
 claude_scripts/
-codex_doc/
 install/
 tc_public/
 contest.pdf
