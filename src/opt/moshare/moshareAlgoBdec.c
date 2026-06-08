@@ -1,0 +1,926 @@
+/**CFile****************************************************************
+
+  FileName    [moshareAlgoBdec.c]
+
+  SystemName  [ABC: Logic synthesis and verification system.]
+
+  PackageName [Multi-output sharing optimization framework — Boolean decomposition algorithm.]
+
+  Synopsis    [Boolean decomposition candidate audit and optimization for multi-output sharing.]
+
+  Author      [Contest]
+
+  Date        [Ver. 1.0. Started - June 8, 2026.]
+
+***********************************************************************/
+
+#include "moshare.h"
+
+#include <limits.h>
+
+ABC_NAMESPACE_IMPL_START
+
+////////////////////////////////////////////////////////////////////////
+///                         LOCAL CONSTANTS                           ///
+////////////////////////////////////////////////////////////////////////
+
+#define MOSH_BDEC_TOP_PRINT 20
+
+////////////////////////////////////////////////////////////////////////
+///                         LOCAL TYPES                               ///
+////////////////////////////////////////////////////////////////////////
+
+typedef struct Mosh_BdecWin_t_ {
+    Vec_Int_t * vLeaves;    // object IDs of local leaves, sorted ascending
+    Vec_Int_t * vNodes;     // internal AND object IDs, sorted ascending (topological)
+    Vec_Int_t * vOutLits;   // GIA literals driving local outputs (CO driver literals)
+    Vec_Int_t * vOutCos;    // CO indices; -1 for non-CO local outputs
+} Mosh_BdecWin_t;
+
+typedef struct Mosh_BdecStats_t_ {
+    int nWindowsTried;
+    int nWindowsMultiOutput;
+    int nWindowsSmallEnough;
+    int nWindowsSkippedLeaves;
+    int nWindowsSkippedNodes;
+    int nWindowsSkippedSingleOutput;
+    int nTruthComputed;
+    int nDivisorsRaw;
+    int nDivisorsUnique;
+    int nDivisorsMultiOutput;
+    int nDivisorsExisting;
+    int nCandidatesCapped;
+    int nBestScore;
+} Mosh_BdecStats_t;
+
+typedef struct Mosh_BdecCand_t_ {
+    int   iLeaf0;
+    int   iLeaf1;
+    int   fCompl0;
+    int   fCompl1;
+    int   fOr;
+    int   nOutputHits;
+    int   nSupportHits;
+    int   fExisting;
+    int   nScore;
+    word  Truth;
+} Mosh_BdecCand_t;
+
+////////////////////////////////////////////////////////////////////////
+///                     LOCAL FUNCTIONS                              ///
+////////////////////////////////////////////////////////////////////////
+
+static void Mosh_BdecStatsClear( Mosh_BdecStats_t * p )
+{
+    p->nWindowsTried            = 0;
+    p->nWindowsMultiOutput      = 0;
+    p->nWindowsSmallEnough      = 0;
+    p->nWindowsSkippedLeaves    = 0;
+    p->nWindowsSkippedNodes     = 0;
+    p->nWindowsSkippedSingleOutput = 0;
+    p->nTruthComputed           = 0;
+    p->nDivisorsRaw             = 0;
+    p->nDivisorsUnique          = 0;
+    p->nDivisorsMultiOutput     = 0;
+    p->nDivisorsExisting        = 0;
+    p->nCandidatesCapped        = 0;
+    p->nBestScore               = 0;
+}
+
+static void Mosh_BdecStatsPrint( Mosh_BdecStats_t * p )
+{
+    fprintf( stdout, "moshare (algo bdec): windows tried          = %d\n", p->nWindowsTried );
+    fprintf( stdout, "moshare (algo bdec): multi-output windows    = %d\n", p->nWindowsMultiOutput );
+    fprintf( stdout, "moshare (algo bdec): single-output skipped    = %d\n", p->nWindowsSkippedSingleOutput );
+    fprintf( stdout, "moshare (algo bdec): small windows            = %d\n", p->nWindowsSmallEnough );
+    fprintf( stdout, "moshare (algo bdec): skipped (leaves)         = %d\n", p->nWindowsSkippedLeaves );
+    fprintf( stdout, "moshare (algo bdec): skipped (nodes)          = %d\n", p->nWindowsSkippedNodes );
+    fprintf( stdout, "moshare (algo bdec): truth outputs            = %d\n", p->nTruthComputed );
+    fprintf( stdout, "moshare (algo bdec): divisors raw/unique/multi = %d / %d / %d\n",
+        p->nDivisorsRaw, p->nDivisorsUnique, p->nDivisorsMultiOutput );
+    fprintf( stdout, "moshare (algo bdec): existing divisor matches  = %d\n", p->nDivisorsExisting );
+    fprintf( stdout, "moshare (algo bdec): best audit score          = %d\n", p->nBestScore );
+    if ( p->nCandidatesCapped > 0 )
+        fprintf( stdout, "moshare (algo bdec): candidate cap hits        = %d\n", p->nCandidatesCapped );
+}
+
+// --- window lifecycle ---
+
+static Mosh_BdecWin_t * Mosh_BdecWinAlloc()
+{
+    Mosh_BdecWin_t * p = ABC_ALLOC( Mosh_BdecWin_t, 1 );
+    p->vLeaves  = Vec_IntAlloc( 16 );
+    p->vNodes   = Vec_IntAlloc( 64 );
+    p->vOutLits = Vec_IntAlloc( 8 );
+    p->vOutCos  = Vec_IntAlloc( 8 );
+    return p;
+}
+
+static void Mosh_BdecWinClear( Mosh_BdecWin_t * p )
+{
+    Vec_IntClear( p->vLeaves );
+    Vec_IntClear( p->vNodes );
+    Vec_IntClear( p->vOutLits );
+    Vec_IntClear( p->vOutCos );
+}
+
+static void Mosh_BdecWinFree( Mosh_BdecWin_t * p )
+{
+    if ( !p ) return;
+    Vec_IntFree( p->vLeaves );
+    Vec_IntFree( p->vNodes );
+    Vec_IntFree( p->vOutLits );
+    Vec_IntFree( p->vOutCos );
+    ABC_FREE( p );
+}
+
+static void Mosh_BdecWinSortNormalize( Mosh_BdecWin_t * p )
+{
+    Vec_IntSort( p->vLeaves,  0 );
+    Vec_IntSort( p->vNodes,   0 );
+}
+
+// --- cone collection ---
+
+/**Function*************************************************************
+
+  Synopsis    [Recursively collects the TFI cone of a literal into the window.]
+
+  Description [Adds CIs to vLeaves and AND nodes to vNodes. vLeafSeen and
+  vObjSeen are used as bit-flag vectors indexed by object ID.]
+
+  Returns 1 on success, 0 if bounds are exceeded (window is left in an
+  incomplete state and should be discarded).
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecCollectConeLit( Gia_Man_t * pGia, int iLit, Mosh_Par_t * pPar,
+                                     Mosh_BdecWin_t * pWin, Vec_Int_t * vObjSeen,
+                                     Vec_Int_t * vLeafSeen )
+{
+    int iObj = Abc_Lit2Var( iLit );
+    Gia_Obj_t * pObj;
+
+    // const0 node: nothing to collect
+    if ( iObj == 0 )
+        return 1;
+
+    // CI: add as leaf if not already seen
+    pObj = Gia_ManObj( pGia, iObj );
+    if ( Gia_ObjIsCi( pObj ) )
+    {
+        if ( !Vec_IntEntry( vLeafSeen, iObj ) )
+        {
+            if ( Vec_IntSize( pWin->vLeaves ) >= pPar->nMaxCutSize )
+                return 0;
+            Vec_IntPush( pWin->vLeaves, iObj );
+            Vec_IntWriteEntry( vLeafSeen, iObj, 1 );
+        }
+        return 1;
+    }
+
+    // not an AND node: unsupported structure
+    if ( !Gia_ObjIsAnd( pObj ) )
+        return 0;
+
+    // already collected this node
+    if ( Vec_IntEntry( vObjSeen, iObj ) )
+        return 1;
+
+    // check node budget
+    if ( Vec_IntSize( pWin->vNodes ) >= pPar->nMaxWindowSize )
+        return 0;
+
+    // recurse into fanins
+    if ( !Mosh_BdecCollectConeLit( pGia, Gia_ObjFaninLit0p( pGia, pObj ), pPar, pWin, vObjSeen, vLeafSeen ) )
+        return 0;
+    if ( !Mosh_BdecCollectConeLit( pGia, Gia_ObjFaninLit1p( pGia, pObj ), pPar, pWin, vObjSeen, vLeafSeen ) )
+        return 0;
+
+    // add this node
+    Vec_IntWriteEntry( vObjSeen, iObj, 1 );
+    Vec_IntPush( pWin->vNodes, iObj );
+    return 1;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Collects the TFI cone of a single CO driver into a window.]
+
+  Description [Allocates temporary seen vectors, collects the cone, and
+  normalizes the window. Returns 1 on success, 0 on bounds overflow.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecCollectCoWindow( Gia_Man_t * pGia, int iCo, Mosh_Par_t * pPar,
+                                      Mosh_BdecWin_t * pWin, Vec_Int_t * vObjSeen,
+                                      Vec_Int_t * vLeafSeen, Mosh_BdecStats_t * pStats )
+{
+    Gia_Obj_t * pCo = Gia_ManCo( pGia, iCo );
+    int iLit = Gia_ObjFaninLit0p( pGia, pCo );
+    int nNodesBefore, nLeavesBefore;
+
+    nNodesBefore  = Vec_IntSize( pWin->vNodes );
+    nLeavesBefore = Vec_IntSize( pWin->vLeaves );
+
+    if ( !Mosh_BdecCollectConeLit( pGia, iLit, pPar, pWin, vObjSeen, vLeafSeen ) )
+    {
+        // roll back partial collection
+        while ( Vec_IntSize( pWin->vNodes ) > nNodesBefore )
+        {
+            int iObj = Vec_IntPop( pWin->vNodes );
+            Vec_IntWriteEntry( vObjSeen, iObj, 0 );
+        }
+        while ( Vec_IntSize( pWin->vLeaves ) > nLeavesBefore )
+        {
+            int iObj = Vec_IntPop( pWin->vLeaves );
+            Vec_IntWriteEntry( vLeafSeen, iObj, 0 );
+        }
+
+        if ( Vec_IntSize( pWin->vNodes ) >= pPar->nMaxWindowSize )
+            pStats->nWindowsSkippedNodes++;
+        else
+            pStats->nWindowsSkippedLeaves++;
+        return 0;
+    }
+
+    // record the CO driver as a local output
+    Vec_IntPush( pWin->vOutLits, iLit );
+    Vec_IntPush( pWin->vOutCos,  iCo );
+
+    return 1;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Checks whether two windows can be merged without exceeding the leaf limit.]
+
+  Description [Computes the union of two sorted leaf sets and returns the
+  union size. Returns 0 if the union would exceed nMaxLeaves.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecWinCanMergeLeaves( Mosh_BdecWin_t * pA, Mosh_BdecWin_t * pB, int nMaxLeaves )
+{
+    int iA, iB, nA, nB, nUnion;
+    nA = Vec_IntSize( pA->vLeaves );
+    nB = Vec_IntSize( pB->vLeaves );
+    iA = iB = nUnion = 0;
+
+    while ( iA < nA || iB < nB )
+    {
+        int leafA = (iA < nA) ? Vec_IntEntry( pA->vLeaves, iA ) : INT_MAX;
+        int leafB = (iB < nB) ? Vec_IntEntry( pB->vLeaves, iB ) : INT_MAX;
+
+        if ( leafA < leafB )
+        {
+            nUnion++;
+            iA++;
+        }
+        else if ( leafB < leafA )
+        {
+            nUnion++;
+            iB++;
+        }
+        else
+        {
+            nUnion++;
+            iA++;
+            iB++;
+        }
+
+        if ( nUnion > nMaxLeaves )
+            return 0;
+    }
+
+    return nUnion;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Merges pOther's outputs, nodes, and leaves into pBase.]
+
+  Description [Computes the union leaf set. Deduplicates nodes and leaves.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static void Mosh_BdecWinMergeUnion( Mosh_BdecWin_t * pBase, Mosh_BdecWin_t * pOther,
+                                     Gia_Man_t * pGia, Vec_Int_t * vObjSeen, Vec_Int_t * vLeafSeen )
+{
+    int i, iObj;
+    Vec_Int_t * vMerged;
+
+    // merge nodes
+    Vec_IntForEachEntry( pOther->vNodes, iObj, i )
+    {
+        if ( !Vec_IntEntry( vObjSeen, iObj ) )
+        {
+            Vec_IntWriteEntry( vObjSeen, iObj, 1 );
+            Vec_IntPush( pBase->vNodes, iObj );
+        }
+    }
+
+    // merge leaves (union of sorted sets)
+    vMerged = Vec_IntAlloc( Vec_IntSize(pBase->vLeaves) + Vec_IntSize(pOther->vLeaves) );
+    {
+        int iA = 0, iB = 0;
+        int nA = Vec_IntSize( pBase->vLeaves );
+        int nB = Vec_IntSize( pOther->vLeaves );
+        while ( iA < nA || iB < nB )
+        {
+            int leafA = (iA < nA) ? Vec_IntEntry( pBase->vLeaves, iA ) : INT_MAX;
+            int leafB = (iB < nB) ? Vec_IntEntry( pOther->vLeaves, iB ) : INT_MAX;
+            if ( leafA < leafB )
+            {
+                Vec_IntPush( vMerged, leafA );
+                iA++;
+            }
+            else if ( leafB < leafA )
+            {
+                Vec_IntPush( vMerged, leafB );
+                Vec_IntWriteEntry( vLeafSeen, leafB, 1 );
+                iB++;
+            }
+            else
+            {
+                Vec_IntPush( vMerged, leafA );
+                iA++;
+                iB++;
+            }
+        }
+    }
+    Vec_IntClear( pBase->vLeaves );
+    Vec_IntForEachEntry( vMerged, iObj, i )
+        Vec_IntPush( pBase->vLeaves, iObj );
+    Vec_IntFree( vMerged );
+
+    // merge outputs
+    Vec_IntForEachEntry( pOther->vOutLits, iObj, i )
+        Vec_IntPush( pBase->vOutLits, iObj );
+    Vec_IntForEachEntry( pOther->vOutCos, iObj, i )
+        Vec_IntPush( pBase->vOutCos, iObj );
+}
+
+// --- truth table helpers ---
+
+static word Mosh_BdecTruthMask( int nVars )
+{
+    int nBits = 1 << nVars;
+    if ( nBits >= 64 )
+        return ~(word)0;
+    return ((word)1 << nBits) - 1;
+}
+
+static word Mosh_BdecTruthVar( int iVar, int nVars )
+{
+    // Precomputed truth-table columns for up to 6 variables
+    static const word s_VarTruths[6] = {
+        0xAAAAAAAAAAAAAAAAULL,
+        0xCCCCCCCCCCCCCCCCULL,
+        0xF0F0F0F0F0F0F0F0ULL,
+        0xFF00FF00FF00FF00ULL,
+        0xFFFF0000FFFF0000ULL,
+        0xFFFFFFFF00000000ULL
+    };
+    assert( iVar >= 0 && iVar < 6 );
+    return s_VarTruths[iVar];
+}
+
+static word Mosh_BdecTruthNot( word t, int nVars )
+{
+    return (~t) & Mosh_BdecTruthMask( nVars );
+}
+
+static int Mosh_BdecObjToLeafIndex( Vec_Int_t * vLeaves, int iObj )
+{
+    int i;
+    Vec_IntForEachEntry( vLeaves, i, i )
+        if ( i == iObj )
+            return i;
+    return -1;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Computes support mask from a truth table.]
+
+  Description [Returns a bitmask where bit v is set if variable v is in
+  the support of the function.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecTruthSupportMask( word t, int nVars )
+{
+    int v, support = 0;
+    int nBits = 1 << nVars;
+
+    for ( v = 0; v < nVars; v++ )
+    {
+        int m;
+        for ( m = 0; m < nBits; m++ )
+        {
+            int mate = m ^ (1 << v);
+            if ( ((t >> m) & 1) != ((t >> mate) & 1) )
+            {
+                support |= (1 << v);
+                break;
+            }
+        }
+    }
+
+    return support;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Computes truth tables for all nodes and outputs in a window.]
+
+  Description [Fills vObjTruths (sized to nObjs) with truth-table words for
+  leaves and internal nodes in pWin. Fills vOutTruths with truth-table words
+  for each output literal in pWin.]
+
+  Returns 1 on success, 0 on failure.
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecComputeTruths( Gia_Man_t * pGia, Mosh_BdecWin_t * pWin,
+                                    Vec_Wrd_t * vObjTruths, Vec_Wrd_t * vOutTruths )
+{
+    int nVars = Vec_IntSize( pWin->vLeaves );
+    word Mask = Mosh_BdecTruthMask( nVars );
+    int i, iObj, iLit;
+    word t0, t1;
+
+    if ( nVars < 1 || nVars > 6 )
+        return 0;
+
+    // assign leaf truth tables
+    Vec_IntForEachEntry( pWin->vLeaves, iObj, i )
+    {
+        Vec_WrdWriteEntry( vObjTruths, iObj, Mosh_BdecTruthVar( i, nVars ) );
+    }
+
+    // compute node truth tables in topological order (ascending ID)
+    Vec_IntForEachEntry( pWin->vNodes, iObj, i )
+    {
+        Gia_Obj_t * pObj = Gia_ManObj( pGia, iObj );
+        int iFan0 = Gia_ObjFaninId0p( pGia, pObj );
+        int iFan1 = Gia_ObjFaninId1p( pGia, pObj );
+
+        t0 = Vec_WrdEntry( vObjTruths, iFan0 );
+        if ( Gia_ObjFaninC0( pObj ) )
+            t0 = (~t0) & Mask;
+
+        t1 = Vec_WrdEntry( vObjTruths, iFan1 );
+        if ( Gia_ObjFaninC1( pObj ) )
+            t1 = (~t1) & Mask;
+
+        Vec_WrdWriteEntry( vObjTruths, iObj, (t0 & t1) & Mask );
+    }
+
+    // compute output truth tables
+    Vec_IntForEachEntry( pWin->vOutLits, iLit, i )
+    {
+        int iVar = Abc_Lit2Var( iLit );
+        word t;
+
+        if ( iVar == 0 )
+        {
+            // const0 node
+            t = Abc_LitIsCompl( iLit ) ? Mask : 0;
+        }
+        else if ( Gia_ObjIsCi( Gia_ManObj( pGia, iVar ) ) )
+        {
+            // CI (leaf): find its index
+            int iLeaf = Mosh_BdecObjToLeafIndex( pWin->vLeaves, iVar );
+            if ( iLeaf < 0 )
+                return 0; // output depends on a non-leaf CI — should not happen
+            t = Mosh_BdecTruthVar( iLeaf, nVars );
+            if ( Abc_LitIsCompl( iLit ) )
+                t = (~t) & Mask;
+        }
+        else
+        {
+            // internal node: use computed truth
+            t = Vec_WrdEntry( vObjTruths, iVar );
+            if ( Abc_LitIsCompl( iLit ) )
+                t = (~t) & Mask;
+        }
+
+        Vec_WrdPush( vOutTruths, t );
+    }
+
+    return 1;
+}
+
+// --- divisor enumeration ---
+
+/**Function*************************************************************
+
+  Synopsis    [Checks whether a divisor truth is already in the seen list.]
+
+  Returns 1 if seen, 0 otherwise.
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecDivisorSeen( Vec_Wrd_t * vDivTruths, word Truth )
+{
+    int i;
+    word t;
+    Vec_WrdForEachEntry( vDivTruths, t, i )
+        if ( t == Truth )
+            return 1;
+    return 0;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Checks whether a divisor truth matches any internal node truth or its complement.]
+
+  Returns 1 if a match is found.
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static int Mosh_BdecFindExistingNode( Vec_Int_t * vNodes, Vec_Wrd_t * vObjTruths, word Mask, word Truth )
+{
+    int i, iObj;
+    word tNode;
+    Vec_IntForEachEntry( vNodes, iObj, i )
+    {
+        tNode = Vec_WrdEntry( vObjTruths, iObj );
+        if ( tNode == Truth || tNode == ((~Truth) & Mask) )
+            return 1;
+    }
+    return 0;
+}
+
+/**Function*************************************************************
+
+  Synopsis    [Enumerate two-literal divisors for one window and update stats.]
+
+  Description [Enumerates all AND/OR divisor forms for every unordered leaf
+  pair with all polarity combinations. Deduplicates by truth table and scores
+  by multi-output support overlap.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
+                                    Vec_Wrd_t * vObjTruths,
+                                    Vec_Wrd_t * vOutTruths,
+                                    Mosh_Par_t * pPar,
+                                    Mosh_BdecStats_t * pStats,
+                                    Mosh_BdecCand_t * pBestGlobal )
+{
+    int nVars   = Vec_IntSize( pWin->vLeaves );
+    int nOuts   = Vec_WrdSize( vOutTruths );
+    word Mask   = Mosh_BdecTruthMask( nVars );
+    Vec_Wrd_t * vDivTruths = Vec_WrdAlloc( 128 );
+    int i, j, ci, cj, fOr;
+    int nProcessed = 0;
+    Mosh_BdecCand_t bestLocal;
+    int * pOutSupports;
+
+    memset( &bestLocal, 0, sizeof(bestLocal) );
+
+    // precompute output support masks
+    pOutSupports = ABC_ALLOC( int, nOuts );
+    for ( i = 0; i < nOuts; i++ )
+        pOutSupports[i] = Mosh_BdecTruthSupportMask( Vec_WrdEntry( vOutTruths, i ), nVars );
+
+    // enumerate all unordered leaf pairs
+    for ( i = 0; i < nVars; i++ )
+    {
+        word tVarI = Mosh_BdecTruthVar( i, nVars );
+
+        for ( j = i + 1; j < nVars; j++ )
+        {
+            word tVarJ = Mosh_BdecTruthVar( j, nVars );
+
+            for ( ci = 0; ci <= 1; ci++ )
+            {
+                word tLitI = ci ? (~tVarI) & Mask : tVarI;
+
+                for ( cj = 0; cj <= 1; cj++ )
+                {
+                    word tLitJ = cj ? (~tVarJ) & Mask : tVarJ;
+
+                    for ( fOr = 0; fOr <= 1; fOr++ )
+                    {
+                        word tDiv;
+                        int nSupportHits, nOutputHits, fExisting;
+                        Mosh_BdecCand_t cand;
+
+                        // cap check
+                        if ( nProcessed >= pPar->nMaxCandidates )
+                        {
+                            if ( nProcessed == pPar->nMaxCandidates )
+                                pStats->nCandidatesCapped++;
+                            nProcessed++;
+                            continue;
+                        }
+                        nProcessed++;
+
+                        tDiv = fOr ? ((tLitI | tLitJ) & Mask) : ((tLitI & tLitJ) & Mask);
+
+                        // deduplicate within this window
+                        if ( Mosh_BdecDivisorSeen( vDivTruths, tDiv ) )
+                            continue;
+
+                        Vec_WrdPush( vDivTruths, tDiv );
+                        pStats->nDivisorsRaw++;
+
+                        // count unique divisors
+                        pStats->nDivisorsUnique++;
+
+                        // compute support hits: how many outputs have BOTH leaf vars in support
+                        {
+                            int bothMask = (1 << i) | (1 << j);
+                            nSupportHits = 0;
+                            for ( nOutputHits = 0; nOutputHits < nOuts; nOutputHits++ )
+                                if ( (pOutSupports[nOutputHits] & bothMask) == bothMask )
+                                    nSupportHits++;
+                        }
+                        nOutputHits = nSupportHits; // Version 0: use support overlap as proxy
+
+                        // check existing node match
+                        fExisting = Mosh_BdecFindExistingNode( pWin->vNodes, vObjTruths, Mask, tDiv );
+                        if ( fExisting )
+                            pStats->nDivisorsExisting++;
+
+                        if ( nSupportHits >= 2 )
+                            pStats->nDivisorsMultiOutput++;
+
+                        // score
+                        cand.iLeaf0      = i;
+                        cand.iLeaf1      = j;
+                        cand.fCompl0     = ci;
+                        cand.fCompl1     = cj;
+                        cand.fOr         = fOr;
+                        cand.nOutputHits = nOutputHits;
+                        cand.nSupportHits = nSupportHits;
+                        cand.fExisting   = fExisting;
+                        cand.nScore      = 10 * nSupportHits + 3 * fExisting - 1;
+                        cand.Truth       = tDiv;
+
+                        // track best
+                        if ( cand.nScore > bestLocal.nScore )
+                            bestLocal = cand;
+                        if ( cand.nScore > pBestGlobal->nScore )
+                            *pBestGlobal = cand;
+                        if ( cand.nScore > pStats->nBestScore )
+                            pStats->nBestScore = cand.nScore;
+                    }
+                }
+            }
+        }
+    }
+
+    ABC_FREE( pOutSupports );
+    Vec_WrdFree( vDivTruths );
+}
+
+////////////////////////////////////////////////////////////////////////
+///                     FUNCTION DEFINITIONS                         ///
+////////////////////////////////////////////////////////////////////////
+
+/**Function*************************************************************
+
+  Synopsis    [BDec algorithm entry point: candidate audit (Version 0, no-op).]
+
+  Description [Builds bounded multi-output windows from CO drivers,
+  computes truth tables for windows with <= 6 leaves, enumerates two-literal
+  divisors, and reports candidate statistics. Returns the original Gia_Man_t
+  unchanged with fChanged = 0.]
+
+  SideEffects []
+
+  SeeAlso     []
+
+***********************************************************************/
+Gia_Man_t * Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_Res_t * pRes )
+{
+    Mosh_BdecStats_t stats;
+    Mosh_BdecWin_t * pBaseWin;    // accumulating multi-output window
+    Mosh_BdecWin_t * pCurWin;     // current CO's single-output window
+    Vec_Int_t * vObjSeen;         // object-ID -> seen flag for nodes (base window only)
+    Vec_Int_t * vLeafSeen;        // object-ID -> seen flag for leaves (base window only)
+    Vec_Int_t * vProcessedCos;    // boolean: CO already in a group
+    Vec_Wrd_t * vObjTruths;       // object-ID -> truth table word
+    Vec_Wrd_t * vOutTruths;       // per-window output truth tables
+    Mosh_BdecCand_t bestGlobal;
+    int nVerbosePrinted;          // counter for capped verbose output
+    int nObjs, nCos, iCo, jCo;
+    int iLeafLimit;
+
+    // clear result and local stats
+    Mosh_ResClear( pRes );
+    Mosh_BdecStatsClear( &stats );
+    memset( &bestGlobal, 0, sizeof(bestGlobal) );
+
+    // collect before stats
+    pRes->nNodesBefore  = Gia_ManAndNum( pGia );
+    pRes->nLevelsBefore = Gia_ManLevelNum( pGia );
+
+    // allocate temporaries
+    nObjs         = Gia_ManObjNum( pGia );
+    nCos          = Gia_ManCoNum( pGia );
+    vObjSeen      = Vec_IntStart( nObjs );
+    vLeafSeen     = Vec_IntStart( nObjs );
+    vProcessedCos = Vec_IntStart( nCos );
+    pBaseWin      = Mosh_BdecWinAlloc();
+    pCurWin       = Mosh_BdecWinAlloc();
+    vObjTruths    = Vec_WrdStart( nObjs );
+    vOutTruths    = Vec_WrdAlloc( 32 );
+
+    // limit leaves to 6 for truth table even if user passed a larger value
+    iLeafLimit = pPar->nMaxCutSize > 6 ? 6 : pPar->nMaxCutSize;
+    nVerbosePrinted = 0;
+
+    // outer loop: each unprocessed CO starts a new group
+    for ( iCo = 0; iCo < nCos; iCo++ )
+    {
+        int fBaseOk;
+
+        if ( Vec_IntEntry( vProcessedCos, iCo ) )
+            continue;
+
+        // clear base window for a new group
+        Mosh_BdecWinClear( pBaseWin );
+        Vec_IntFill( vObjSeen,   nObjs, 0 );
+        Vec_IntFill( vLeafSeen,  nObjs, 0 );
+
+        // collect the first CO's cone as the base window
+        fBaseOk = Mosh_BdecCollectCoWindow( pGia, iCo, pPar, pBaseWin, vObjSeen, vLeafSeen, &stats );
+        if ( !fBaseOk )
+        {
+            Vec_IntWriteEntry( vProcessedCos, iCo, 1 );
+            continue;
+        }
+
+        Vec_IntWriteEntry( vProcessedCos, iCo, 1 );
+
+        // sort base window's leaves and nodes for deterministic comparison
+        Mosh_BdecWinSortNormalize( pBaseWin );
+
+        // scan later COs to find ones with the same leaf set
+        for ( jCo = iCo + 1; jCo < nCos; jCo++ )
+        {
+            int fOk;
+
+            if ( Vec_IntEntry( vProcessedCos, jCo ) )
+                continue;
+
+            // clear current window for this CO
+            Mosh_BdecWinClear( pCurWin );
+
+            // use fresh seen maps for the candidate CO to avoid shared-node
+            // contamination from the base window
+            {
+                Vec_Int_t * vTmpObj  = Vec_IntStart( nObjs );
+                Vec_Int_t * vTmpLeaf = Vec_IntStart( nObjs );
+                fOk = Mosh_BdecCollectCoWindow( pGia, jCo, pPar, pCurWin, vTmpObj, vTmpLeaf, &stats );
+                Vec_IntFree( vTmpObj );
+                Vec_IntFree( vTmpLeaf );
+            }
+
+            if ( !fOk )
+                continue;
+
+            Mosh_BdecWinSortNormalize( pCurWin );
+
+            // union-based merge: check if merged leaves stay within limit
+            if ( !Mosh_BdecWinCanMergeLeaves( pBaseWin, pCurWin, iLeafLimit ) )
+                continue;
+
+            // merge into base window (union leaves, dedup nodes, append outputs)
+            Mosh_BdecWinMergeUnion( pBaseWin, pCurWin, pGia, vObjSeen, vLeafSeen );
+            Vec_IntWriteEntry( vProcessedCos, jCo, 1 );
+        }
+
+        stats.nWindowsTried++;
+
+        // require at least 2 local outputs for multi-output
+        if ( Vec_IntSize( pBaseWin->vOutLits ) < 2 )
+        {
+            stats.nWindowsSkippedSingleOutput++;
+            continue;
+        }
+
+        stats.nWindowsMultiOutput++;
+
+        // check leaf count for truth table feasibility
+        if ( Vec_IntSize( pBaseWin->vLeaves ) == 0 ||
+             Vec_IntSize( pBaseWin->vLeaves ) > iLeafLimit )
+        {
+            if ( Vec_IntSize( pBaseWin->vLeaves ) > iLeafLimit )
+                stats.nWindowsSkippedLeaves++;
+            continue;
+        }
+
+        stats.nWindowsSmallEnough++;
+
+        // Step 4: compute truth tables
+        {
+            int nLeaves = Vec_IntSize( pBaseWin->vLeaves );
+            int fOk;
+
+            Vec_WrdFill( vObjTruths, nObjs, 0 );
+            Vec_WrdClear( vOutTruths );
+
+            fOk = Mosh_BdecComputeTruths( pGia, pBaseWin, vObjTruths, vOutTruths );
+            if ( !fOk )
+                continue;
+
+            stats.nTruthComputed += Vec_IntSize( pBaseWin->vOutLits );
+
+            // Step 5: enumerate two-literal divisors
+            {
+                Mosh_BdecEvalDivisors( pBaseWin, vObjTruths, vOutTruths, pPar, &stats, &bestGlobal );
+
+                // verbose per-window summary (capped)
+                if ( pPar->fVerbose && nVerbosePrinted < MOSH_BDEC_TOP_PRINT )
+                {
+                    fprintf( stdout, "moshare (algo bdec): window #%d  leaves=%d  nodes=%d  outputs=%d  global_best=%d\n",
+                        nVerbosePrinted + 1,
+                        nLeaves,
+                        Vec_IntSize( pBaseWin->vNodes ),
+                        Vec_IntSize( pBaseWin->vOutLits ),
+                        bestGlobal.nScore );
+                    nVerbosePrinted++;
+                }
+            }
+        }
+    }
+
+    // collect after stats
+    pRes->nNodesAfter   = pRes->nNodesBefore;
+    pRes->nLevelsAfter  = pRes->nLevelsBefore;
+    pRes->nCandidates   = stats.nDivisorsUnique;
+    pRes->nApplied      = 0;
+    pRes->nPartitions   = stats.nWindowsMultiOutput;
+    pRes->fChanged      = 0;
+
+    if ( pPar->fStats )
+    {
+        Mosh_BdecStatsPrint( &stats );
+        fprintf( stdout, "moshare (algo bdec): leaf_merge_mode = union\n" );
+        fprintf( stdout, "moshare (algo bdec): nodes %d -> %d  levels %d -> %d  changed = %d\n",
+            pRes->nNodesBefore, pRes->nNodesAfter,
+            pRes->nLevelsBefore, pRes->nLevelsAfter, pRes->fChanged );
+    }
+
+    if ( pPar->fVerbose && bestGlobal.nScore > 0 )
+    {
+        fprintf( stdout, "moshare (algo bdec): best global candidate:\n" );
+        fprintf( stdout, "  leaf pair     = %d, %d\n", bestGlobal.iLeaf0, bestGlobal.iLeaf1 );
+        fprintf( stdout, "  polarities    = %s%d, %s%d\n",
+            bestGlobal.fCompl0 ? "~" : "", bestGlobal.iLeaf0,
+            bestGlobal.fCompl1 ? "~" : "", bestGlobal.iLeaf1 );
+        fprintf( stdout, "  operator      = %s\n", bestGlobal.fOr ? "OR" : "AND" );
+        fprintf( stdout, "  output hits   = %d\n", bestGlobal.nOutputHits );
+        fprintf( stdout, "  support hits  = %d\n", bestGlobal.nSupportHits );
+        fprintf( stdout, "  existing node = %d\n", bestGlobal.fExisting );
+        fprintf( stdout, "  score         = %d\n", bestGlobal.nScore );
+        fprintf( stdout, "  truth         = 0x%016llx\n", (unsigned long long)bestGlobal.Truth );
+    }
+
+    // free temporaries
+    Mosh_BdecWinFree( pBaseWin );
+    Mosh_BdecWinFree( pCurWin );
+    Vec_IntFree( vObjSeen );
+    Vec_IntFree( vLeafSeen );
+    Vec_IntFree( vProcessedCos );
+    Vec_WrdFree( vObjTruths );
+    Vec_WrdFree( vOutTruths );
+
+    return pGia;
+}
+
+ABC_NAMESPACE_IMPL_END

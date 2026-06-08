@@ -30,7 +30,7 @@
 
 ABC_NAMESPACE_HEADER_START
 
-#define MOSH_ALGO_COUNT 2
+#define MOSH_ALGO_COUNT 3
 
 ////////////////////////////////////////////////////////////////////////
 ///                         BASIC TYPES                              ///
@@ -38,7 +38,8 @@ ABC_NAMESPACE_HEADER_START
 
 typedef enum Mosh_AlgoId_t_ {
     MOSH_ALGO_NONE  = 0,
-    MOSH_ALGO_BDIFF = 1
+    MOSH_ALGO_BDIFF = 1,
+    MOSH_ALGO_BDEC  = 2
 } Mosh_AlgoId_t;
 
 typedef struct Mosh_Par_t_ {
@@ -85,6 +86,9 @@ Gia_Man_t *  Mosh_ManPerformAlgoNone( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_
 
 /*=== moshareAlgoBdiff.c ====================================================*/
 Gia_Man_t *  Mosh_ManPerformAlgoBdiff( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_Res_t * pRes );
+
+/*=== moshareAlgoBdec.c =====================================================*/
+Gia_Man_t *  Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_Res_t * pRes );
 
 ABC_NAMESPACE_HEADER_END
 

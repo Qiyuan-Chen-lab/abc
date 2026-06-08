@@ -46,6 +46,8 @@ Gia_Man_t * Mosh_ManPerform( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_Res_t * p
         return Mosh_ManPerformAlgoNone( pGia, pPar, pRes );
     case MOSH_ALGO_BDIFF:
         return Mosh_ManPerformAlgoBdiff( pGia, pPar, pRes );
+    case MOSH_ALGO_BDEC:
+        return Mosh_ManPerformAlgoBdec( pGia, pPar, pRes );
     default:
         Mosh_ResClear( pRes );
         if ( pPar->fVerbose )

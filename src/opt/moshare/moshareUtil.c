@@ -88,6 +88,8 @@ int Mosh_AlgoNameToId( const char * pName )
         return MOSH_ALGO_NONE;
     if ( strcmp( pName, "bdiff" ) == 0 )
         return MOSH_ALGO_BDIFF;
+    if ( strcmp( pName, "bdec" ) == 0 )
+        return MOSH_ALGO_BDEC;
     return -1;
 }
 
@@ -108,6 +110,7 @@ const char * Mosh_AlgoIdToName( int AlgoId )
     {
     case MOSH_ALGO_NONE:  return "none";
     case MOSH_ALGO_BDIFF: return "bdiff";
+    case MOSH_ALGO_BDEC:  return "bdec";
     default:              return NULL;
     }
 }
