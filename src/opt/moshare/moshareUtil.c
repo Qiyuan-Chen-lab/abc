@@ -67,6 +67,11 @@ void Mosh_ResClear( Mosh_Res_t * pRes )
     pRes->nLevelsAfter  = 0;
     pRes->nCandidates   = 0;
     pRes->nApplied      = 0;
+    pRes->nPartitions   = 0;
+    pRes->nRejectedSupport = 0;
+    pRes->nRejectedBdd  = 0;
+    pRes->nRejectedProfit = 0;
+    pRes->nRejectedLevel = 0;
 }
 
 /**Function*************************************************************

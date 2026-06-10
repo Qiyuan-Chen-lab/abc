@@ -15,10 +15,14 @@
 ***********************************************************************/
 
 #include "moshare.h"
+#include "bool/kit/kit.h"
 
 #include <limits.h>
 
 ABC_NAMESPACE_IMPL_START
+
+extern int Kit_TruthToGia( Gia_Man_t * pMan, unsigned * pTruth, int nVars,
+                           Vec_Int_t * vMemory, Vec_Int_t * vLeaves, int fHash );
 
 ////////////////////////////////////////////////////////////////////////
 ///                         LOCAL CONSTANTS                           ///
@@ -44,12 +48,18 @@ typedef struct Mosh_BdecStats_t_ {
     int nWindowsSkippedLeaves;
     int nWindowsSkippedNodes;
     int nWindowsSkippedSingleOutput;
+    int nWindowsTruthFailed;
     int nTruthComputed;
     int nDivisorsRaw;
     int nDivisorsUnique;
     int nDivisorsMultiOutput;
     int nDivisorsExisting;
+    int nDivisorsDecomposable;
     int nCandidatesCapped;
+    int nReplacementTried;
+    int nReplacementAccepted;
+    int nRejectedProfit;
+    int nRejectedLevel;
     int nBestScore;
 } Mosh_BdecStats_t;
 
@@ -61,7 +71,10 @@ typedef struct Mosh_BdecCand_t_ {
     int   fOr;
     int   nOutputHits;
     int   nSupportHits;
+    int   nDecOutputs;
     int   fExisting;
+    int   iExistingObj;
+    int   fExistingCompl;
     int   nScore;
     word  Truth;
 } Mosh_BdecCand_t;
@@ -78,12 +91,18 @@ static void Mosh_BdecStatsClear( Mosh_BdecStats_t * p )
     p->nWindowsSkippedLeaves    = 0;
     p->nWindowsSkippedNodes     = 0;
     p->nWindowsSkippedSingleOutput = 0;
+    p->nWindowsTruthFailed      = 0;
     p->nTruthComputed           = 0;
     p->nDivisorsRaw             = 0;
     p->nDivisorsUnique          = 0;
     p->nDivisorsMultiOutput     = 0;
     p->nDivisorsExisting        = 0;
+    p->nDivisorsDecomposable    = 0;
     p->nCandidatesCapped        = 0;
+    p->nReplacementTried        = 0;
+    p->nReplacementAccepted     = 0;
+    p->nRejectedProfit          = 0;
+    p->nRejectedLevel           = 0;
     p->nBestScore               = 0;
 }
 
@@ -95,13 +114,27 @@ static void Mosh_BdecStatsPrint( Mosh_BdecStats_t * p )
     fprintf( stdout, "moshare (algo bdec): small windows            = %d\n", p->nWindowsSmallEnough );
     fprintf( stdout, "moshare (algo bdec): skipped (leaves)         = %d\n", p->nWindowsSkippedLeaves );
     fprintf( stdout, "moshare (algo bdec): skipped (nodes)          = %d\n", p->nWindowsSkippedNodes );
+    fprintf( stdout, "moshare (algo bdec): truth failed windows     = %d\n", p->nWindowsTruthFailed );
     fprintf( stdout, "moshare (algo bdec): truth outputs            = %d\n", p->nTruthComputed );
     fprintf( stdout, "moshare (algo bdec): divisors raw/unique/multi = %d / %d / %d\n",
         p->nDivisorsRaw, p->nDivisorsUnique, p->nDivisorsMultiOutput );
     fprintf( stdout, "moshare (algo bdec): existing divisor matches  = %d\n", p->nDivisorsExisting );
+    fprintf( stdout, "moshare (algo bdec): decomposable divisors     = %d\n", p->nDivisorsDecomposable );
+    fprintf( stdout, "moshare (algo bdec): replacements tried/accepted = %d / %d\n",
+        p->nReplacementTried, p->nReplacementAccepted );
+    fprintf( stdout, "moshare (algo bdec): reject_profit             = %d\n", p->nRejectedProfit );
+    fprintf( stdout, "moshare (algo bdec): reject_level              = %d\n", p->nRejectedLevel );
     fprintf( stdout, "moshare (algo bdec): best audit score          = %d\n", p->nBestScore );
     if ( p->nCandidatesCapped > 0 )
         fprintf( stdout, "moshare (algo bdec): candidate cap hits        = %d\n", p->nCandidatesCapped );
+}
+
+static void Mosh_BdecCandClear( Mosh_BdecCand_t * p )
+{
+    memset( p, 0, sizeof(*p) );
+    p->iLeaf0 = -1;
+    p->iLeaf1 = -1;
+    p->iExistingObj = -1;
 }
 
 // --- window lifecycle ---
@@ -405,9 +438,9 @@ static word Mosh_BdecTruthNot( word t, int nVars )
 
 static int Mosh_BdecObjToLeafIndex( Vec_Int_t * vLeaves, int iObj )
 {
-    int i;
-    Vec_IntForEachEntry( vLeaves, i, i )
-        if ( i == iObj )
+    int i, iEntry;
+    Vec_IntForEachEntry( vLeaves, iEntry, i )
+        if ( iEntry == iObj )
             return i;
     return -1;
 }
@@ -565,17 +598,328 @@ static int Mosh_BdecDivisorSeen( Vec_Wrd_t * vDivTruths, word Truth )
   SeeAlso     []
 
 ***********************************************************************/
-static int Mosh_BdecFindExistingNode( Vec_Int_t * vNodes, Vec_Wrd_t * vObjTruths, word Mask, word Truth )
+static int Mosh_BdecFindExistingNode( Vec_Int_t * vNodes, Vec_Wrd_t * vObjTruths,
+                                      word Mask, word Truth, int * piObj, int * pfCompl )
 {
     int i, iObj;
     word tNode;
+    if ( piObj )
+        *piObj = -1;
+    if ( pfCompl )
+        *pfCompl = 0;
     Vec_IntForEachEntry( vNodes, iObj, i )
     {
         tNode = Vec_WrdEntry( vObjTruths, iObj );
-        if ( tNode == Truth || tNode == ((~Truth) & Mask) )
+        if ( tNode == Truth )
+        {
+            if ( piObj )
+                *piObj = iObj;
+            if ( pfCompl )
+                *pfCompl = 0;
             return 1;
+        }
+        if ( tNode == ((~Truth) & Mask) )
+        {
+            if ( piObj )
+                *piObj = iObj;
+            if ( pfCompl )
+                *pfCompl = 1;
+            return 1;
+        }
     }
     return 0;
+}
+
+static int Mosh_BdecCompressOutputTruth( word tOut, word tDiv, int nVars,
+                                         int iLeaf0, int iLeaf1, word * pTruthNew )
+{
+    int nVarsNew = nVars - 1;
+    int nMints = 1 << nVars;
+    word tNew = 0;
+    word tSeen = 0;
+    int m;
+
+    assert( nVarsNew >= 1 && nVarsNew <= 5 );
+
+    for ( m = 0; m < nMints; m++ )
+    {
+        int fBit = (int)((tOut >> m) & 1);
+        int dBit = (int)((tDiv >> m) & 1);
+        int mNew = dBit;
+        int iVar, iNewVar = 1;
+
+        for ( iVar = 0; iVar < nVars; iVar++ )
+        {
+            if ( iVar == iLeaf0 || iVar == iLeaf1 )
+                continue;
+            if ( (m >> iVar) & 1 )
+                mNew |= (1 << iNewVar);
+            iNewVar++;
+        }
+
+        if ( (tSeen >> mNew) & 1 )
+        {
+            if ( (int)((tNew >> mNew) & 1) != fBit )
+                return 0;
+        }
+        else
+        {
+            tSeen |= ((word)1 << mNew);
+            if ( fBit )
+                tNew |= ((word)1 << mNew);
+        }
+    }
+
+    *pTruthNew = tNew & Mosh_BdecTruthMask( nVarsNew );
+    return 1;
+}
+
+static int Mosh_BdecCollectDecomposableOutputs( Mosh_BdecWin_t * pWin,
+                                                Vec_Wrd_t * vOutTruths,
+                                                word tDiv,
+                                                Mosh_BdecCand_t * pCand,
+                                                Vec_Int_t * vOutIdxs,
+                                                Vec_Wrd_t * vDecTruths )
+{
+    int nVars = Vec_IntSize( pWin->vLeaves );
+    int nOuts = Vec_WrdSize( vOutTruths );
+    int iOut, nDecOuts = 0;
+
+    assert( nVars >= 2 && nVars <= 6 );
+
+    if ( vOutIdxs )
+        Vec_IntClear( vOutIdxs );
+    if ( vDecTruths )
+        Vec_WrdClear( vDecTruths );
+
+    for ( iOut = 0; iOut < nOuts; iOut++ )
+    {
+        word tDec;
+        if ( !Mosh_BdecCompressOutputTruth( Vec_WrdEntry( vOutTruths, iOut ), tDiv,
+                 nVars, pCand->iLeaf0, pCand->iLeaf1, &tDec ) )
+            continue;
+
+        nDecOuts++;
+        if ( vOutIdxs )
+            Vec_IntPush( vOutIdxs, iOut );
+        if ( vDecTruths )
+            Vec_WrdPush( vDecTruths, tDec );
+    }
+
+    return nDecOuts;
+}
+
+static int Mosh_BdecBuildDivisorLit( Gia_Man_t * pGia, Gia_Man_t * pNew,
+                                     Mosh_BdecWin_t * pWin, Mosh_BdecCand_t * pCand )
+{
+    int iLit0, iLit1;
+
+    if ( pCand->iExistingObj >= 0 )
+    {
+        int iLit = Gia_ManObj( pGia, pCand->iExistingObj )->Value;
+        return Abc_LitNotCond( iLit, pCand->fExistingCompl );
+    }
+
+    iLit0 = Gia_ManObj( pGia, Vec_IntEntry( pWin->vLeaves, pCand->iLeaf0 ) )->Value;
+    iLit1 = Gia_ManObj( pGia, Vec_IntEntry( pWin->vLeaves, pCand->iLeaf1 ) )->Value;
+
+    if ( pCand->fCompl0 )
+        iLit0 = Abc_LitNot( iLit0 );
+    if ( pCand->fCompl1 )
+        iLit1 = Abc_LitNot( iLit1 );
+
+    if ( !pCand->fOr )
+        return Gia_ManHashAnd( pNew, iLit0, iLit1 );
+
+    return Abc_LitNot( Gia_ManHashAnd( pNew, Abc_LitNot(iLit0), Abc_LitNot(iLit1) ) );
+}
+
+static void Mosh_BdecBuildSynthLeaves( Gia_Man_t * pGia, Mosh_BdecWin_t * pWin,
+                                       Mosh_BdecCand_t * pCand, int iDivLit,
+                                       Vec_Int_t * vSynthLeaves )
+{
+    int i, iObj;
+    Vec_IntClear( vSynthLeaves );
+    Vec_IntPush( vSynthLeaves, iDivLit );
+    Vec_IntForEachEntry( pWin->vLeaves, iObj, i )
+    {
+        if ( i == pCand->iLeaf0 || i == pCand->iLeaf1 )
+            continue;
+        Vec_IntPush( vSynthLeaves, Gia_ManObj( pGia, iObj )->Value );
+    }
+}
+
+static int Mosh_BdecBuildDecTruth( Gia_Man_t * pNew, word Truth, int nVars,
+                                   Vec_Int_t * vLeaves, Vec_Int_t * vMemory )
+{
+    unsigned uTruth;
+    int m;
+    assert( nVars >= 1 && nVars <= 5 );
+    assert( Vec_IntSize( vLeaves ) == nVars );
+    uTruth = 0;
+    for ( m = 0; m < 32; m++ )
+        if ( (Truth >> (m & ((1 << nVars) - 1))) & 1 )
+            uTruth |= (1u << m);
+    return Kit_TruthToGia( pNew, &uTruth, nVars, vMemory, vLeaves, 1 );
+}
+
+static Gia_Man_t * Mosh_BdecRebuildWithCandidate( Gia_Man_t * pGia,
+                                                  Mosh_BdecWin_t * pWin,
+                                                  Vec_Wrd_t * vOutTruths,
+                                                  Mosh_BdecCand_t * pCand )
+{
+    Gia_Man_t * pNew;
+    Gia_Obj_t * pObj;
+    Vec_Int_t * vOutIdxs, * vSynthLeaves, * vMemory;
+    Vec_Wrd_t * vDecTruths;
+    int * pCoToDec;
+    int nCos, nVarsNew, nDecOuts;
+    int i, iOut, iCo, iObj, iDivLitNew = -1;
+
+    nVarsNew = Vec_IntSize( pWin->vLeaves ) - 1;
+    if ( nVarsNew < 1 || nVarsNew > 5 )
+        return NULL;
+
+    vOutIdxs = Vec_IntAlloc( 8 );
+    vDecTruths = Vec_WrdAlloc( 8 );
+    nDecOuts = Mosh_BdecCollectDecomposableOutputs( pWin, vOutTruths, pCand->Truth,
+        pCand, vOutIdxs, vDecTruths );
+    if ( nDecOuts < 2 )
+    {
+        Vec_IntFree( vOutIdxs );
+        Vec_WrdFree( vDecTruths );
+        return NULL;
+    }
+
+    nCos = Gia_ManCoNum( pGia );
+    pCoToDec = ABC_ALLOC( int, nCos );
+    for ( i = 0; i < nCos; i++ )
+        pCoToDec[i] = -1;
+    Vec_IntForEachEntry( vOutIdxs, iOut, i )
+    {
+        iCo = Vec_IntEntry( pWin->vOutCos, iOut );
+        if ( iCo >= 0 && iCo < nCos )
+            pCoToDec[iCo] = i;
+    }
+
+    pNew = Gia_ManStart( Gia_ManObjNum( pGia ) + 128 );
+    if ( pNew == NULL )
+    {
+        ABC_FREE( pCoToDec );
+        Vec_IntFree( vOutIdxs );
+        Vec_WrdFree( vDecTruths );
+        return NULL;
+    }
+
+    pNew->pName = Abc_UtilStrsav( pGia->pName );
+    pNew->pSpec = Abc_UtilStrsav( pGia->pSpec );
+
+    vSynthLeaves = Vec_IntAlloc( nVarsNew );
+    vMemory = Vec_IntAlloc( 0 );
+
+    Gia_ManConst0( pGia )->Value = 0;
+    Gia_ManHashStart( pNew );
+
+    iCo = 0;
+    Gia_ManForEachObj1( pGia, pObj, iObj )
+    {
+        if ( Gia_ObjIsCi( pObj ) )
+        {
+            pObj->Value = Gia_ManAppendCi( pNew );
+        }
+        else if ( Gia_ObjIsAnd( pObj ) )
+        {
+            pObj->Value = Gia_ManHashAnd( pNew,
+                Gia_ObjFanin0Copy( pObj ), Gia_ObjFanin1Copy( pObj ) );
+        }
+        else if ( Gia_ObjIsCo( pObj ) )
+        {
+            int iDec = iCo < nCos ? pCoToDec[iCo] : -1;
+            if ( iDec >= 0 )
+            {
+                int iLitNew;
+                if ( iDivLitNew < 0 )
+                    iDivLitNew = Mosh_BdecBuildDivisorLit( pGia, pNew, pWin, pCand );
+                Mosh_BdecBuildSynthLeaves( pGia, pWin, pCand, iDivLitNew, vSynthLeaves );
+                iLitNew = Mosh_BdecBuildDecTruth( pNew, Vec_WrdEntry( vDecTruths, iDec ),
+                    nVarsNew, vSynthLeaves, vMemory );
+                pObj->Value = Gia_ManAppendCo( pNew, iLitNew );
+            }
+            else
+            {
+                pObj->Value = Gia_ManAppendCo( pNew, Gia_ObjFanin0Copy( pObj ) );
+            }
+            iCo++;
+        }
+    }
+
+    Gia_ManHashStop( pNew );
+    Gia_ManSetRegNum( pNew, Gia_ManRegNum( pGia ) );
+
+    ABC_FREE( pCoToDec );
+    Vec_IntFree( vOutIdxs );
+    Vec_WrdFree( vDecTruths );
+    Vec_IntFree( vSynthLeaves );
+    Vec_IntFree( vMemory );
+
+    return pNew;
+}
+
+static Gia_Man_t * Mosh_BdecTryApplyCandidate( Gia_Man_t * pGia, Mosh_Par_t * pPar,
+                                               Mosh_BdecWin_t * pWin, Vec_Wrd_t * vOutTruths,
+                                               Mosh_BdecCand_t * pCand,
+                                               Mosh_BdecStats_t * pStats )
+{
+    Gia_Man_t * pNew, * pClean;
+    int nOldAnd, nNewAnd, nOldLevel, nNewLevel, nLevelGrowth;
+
+    pStats->nReplacementTried++;
+
+    if ( pPar->fDryRun )
+        return NULL;
+
+    pNew = Mosh_BdecRebuildWithCandidate( pGia, pWin, vOutTruths, pCand );
+    if ( pNew == NULL )
+        return NULL;
+
+    pClean = Gia_ManCleanup( pNew );
+    if ( pClean != pNew )
+    {
+        Gia_ManStop( pNew );
+        pNew = pClean;
+    }
+
+    nOldAnd = Gia_ManAndNum( pGia );
+    nNewAnd = Gia_ManAndNum( pNew );
+    nOldLevel = Gia_ManLevelNum( pGia );
+    nNewLevel = Gia_ManLevelNum( pNew );
+    nLevelGrowth = nNewLevel - nOldLevel;
+
+    if ( nOldAnd <= nNewAnd )
+    {
+        if ( pPar->fVerbose )
+            fprintf( stdout, "moshare (algo bdec): replacement rejected: old=%d new=%d gain=%d dec_outputs=%d\n",
+                nOldAnd, nNewAnd, nOldAnd - nNewAnd, pCand->nDecOutputs );
+        pStats->nRejectedProfit++;
+        Gia_ManStop( pNew );
+        return NULL;
+    }
+
+    if ( nLevelGrowth > pPar->nMaxLevelGrowth )
+    {
+        if ( pPar->fVerbose )
+            fprintf( stdout, "moshare (algo bdec): replacement rejected: old_level=%d new_level=%d growth=%d\n",
+                nOldLevel, nNewLevel, nLevelGrowth );
+        pStats->nRejectedLevel++;
+        Gia_ManStop( pNew );
+        return NULL;
+    }
+
+    pStats->nReplacementAccepted++;
+    if ( pPar->fVerbose )
+        fprintf( stdout, "moshare (algo bdec): replacement accepted: nodes %d->%d levels %d->%d dec_outputs=%d\n",
+            nOldAnd, nNewAnd, nOldLevel, nNewLevel, pCand->nDecOutputs );
+    return pNew;
 }
 
 /**Function*************************************************************
@@ -591,12 +935,14 @@ static int Mosh_BdecFindExistingNode( Vec_Int_t * vNodes, Vec_Wrd_t * vObjTruths
   SeeAlso     []
 
 ***********************************************************************/
-static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
-                                    Vec_Wrd_t * vObjTruths,
-                                    Vec_Wrd_t * vOutTruths,
-                                    Mosh_Par_t * pPar,
-                                    Mosh_BdecStats_t * pStats,
-                                    Mosh_BdecCand_t * pBestGlobal )
+static Gia_Man_t * Mosh_BdecEvalDivisors( Gia_Man_t * pGia,
+                                           Mosh_BdecWin_t * pWin,
+                                           Vec_Wrd_t * vObjTruths,
+                                           Vec_Wrd_t * vOutTruths,
+                                           Mosh_Par_t * pPar,
+                                           Mosh_BdecStats_t * pStats,
+                                           Mosh_BdecCand_t * pBestGlobal,
+                                           Mosh_BdecCand_t * pBestDecomp )
 {
     int nVars   = Vec_IntSize( pWin->vLeaves );
     int nOuts   = Vec_WrdSize( vOutTruths );
@@ -604,10 +950,8 @@ static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
     Vec_Wrd_t * vDivTruths = Vec_WrdAlloc( 128 );
     int i, j, ci, cj, fOr;
     int nProcessed = 0;
-    Mosh_BdecCand_t bestLocal;
     int * pOutSupports;
-
-    memset( &bestLocal, 0, sizeof(bestLocal) );
+    Gia_Man_t * pNew = NULL;
 
     // precompute output support masks
     pOutSupports = ABC_ALLOC( int, nOuts );
@@ -634,7 +978,8 @@ static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
                     for ( fOr = 0; fOr <= 1; fOr++ )
                     {
                         word tDiv;
-                        int nSupportHits, nOutputHits, fExisting;
+                        int nSupportHits, nOutputHits, nDecOutputs, fExisting;
+                        int iExistingObj, fExistingCompl;
                         Mosh_BdecCand_t cand;
 
                         // cap check
@@ -648,13 +993,13 @@ static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
                         nProcessed++;
 
                         tDiv = fOr ? ((tLitI | tLitJ) & Mask) : ((tLitI & tLitJ) & Mask);
+                        pStats->nDivisorsRaw++;
 
                         // deduplicate within this window
                         if ( Mosh_BdecDivisorSeen( vDivTruths, tDiv ) )
                             continue;
 
                         Vec_WrdPush( vDivTruths, tDiv );
-                        pStats->nDivisorsRaw++;
 
                         // count unique divisors
                         pStats->nDivisorsUnique++;
@@ -670,40 +1015,57 @@ static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
                         nOutputHits = nSupportHits; // Version 0: use support overlap as proxy
 
                         // check existing node match
-                        fExisting = Mosh_BdecFindExistingNode( pWin->vNodes, vObjTruths, Mask, tDiv );
+                        fExisting = Mosh_BdecFindExistingNode( pWin->vNodes, vObjTruths, Mask, tDiv,
+                            &iExistingObj, &fExistingCompl );
                         if ( fExisting )
                             pStats->nDivisorsExisting++;
 
                         if ( nSupportHits >= 2 )
                             pStats->nDivisorsMultiOutput++;
 
-                        // score
+                        // exact bound-set decomposability: f = h(divisor, remaining leaves)
+                        Mosh_BdecCandClear( &cand );
                         cand.iLeaf0      = i;
                         cand.iLeaf1      = j;
                         cand.fCompl0     = ci;
                         cand.fCompl1     = cj;
                         cand.fOr         = fOr;
+                        cand.Truth       = tDiv;
+                        nDecOutputs = Mosh_BdecCollectDecomposableOutputs( pWin, vOutTruths,
+                            tDiv, &cand, NULL, NULL );
+                        if ( nDecOutputs >= 2 )
+                            pStats->nDivisorsDecomposable++;
+
+                        // score
                         cand.nOutputHits = nOutputHits;
                         cand.nSupportHits = nSupportHits;
+                        cand.nDecOutputs = nDecOutputs;
                         cand.fExisting   = fExisting;
-                        cand.nScore      = 10 * nSupportHits + 3 * fExisting - 1;
-                        cand.Truth       = tDiv;
+                        cand.iExistingObj = iExistingObj;
+                        cand.fExistingCompl = fExistingCompl;
+                        cand.nScore      = 10 * nSupportHits + 8 * nDecOutputs + 3 * fExisting - 1;
 
                         // track best
-                        if ( cand.nScore > bestLocal.nScore )
-                            bestLocal = cand;
                         if ( cand.nScore > pBestGlobal->nScore )
                             *pBestGlobal = cand;
+                        if ( nDecOutputs >= 2 && cand.nScore > pBestDecomp->nScore )
+                            *pBestDecomp = cand;
                         if ( cand.nScore > pStats->nBestScore )
                             pStats->nBestScore = cand.nScore;
+
+                        if ( nDecOutputs >= 2 && pNew == NULL )
+                        {
+                            pNew = Mosh_BdecTryApplyCandidate( pGia, pPar, pWin,
+                                vOutTruths, &cand, pStats );
+                        }
                     }
                 }
             }
         }
     }
-
     ABC_FREE( pOutSupports );
     Vec_WrdFree( vDivTruths );
+    return pNew;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -712,12 +1074,12 @@ static void Mosh_BdecEvalDivisors( Mosh_BdecWin_t * pWin,
 
 /**Function*************************************************************
 
-  Synopsis    [BDec algorithm entry point: candidate audit (Version 0, no-op).]
+  Synopsis    [BDec algorithm entry point: candidate audit plus conservative replacement.]
 
   Description [Builds bounded multi-output windows from CO drivers,
   computes truth tables for windows with <= 6 leaves, enumerates two-literal
-  divisors, and reports candidate statistics. Returns the original Gia_Man_t
-  unchanged with fChanged = 0.]
+  divisors, and tries one exact decomposable CO-driver replacement when it
+  strictly reduces AND count without exceeding the level-growth bound.]
 
   SideEffects []
 
@@ -735,6 +1097,7 @@ Gia_Man_t * Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_R
     Vec_Wrd_t * vObjTruths;       // object-ID -> truth table word
     Vec_Wrd_t * vOutTruths;       // per-window output truth tables
     Mosh_BdecCand_t bestGlobal;
+    Gia_Man_t * pNew;
     int nVerbosePrinted;          // counter for capped verbose output
     int nObjs, nCos, iCo, jCo;
     int iLeafLimit;
@@ -742,7 +1105,8 @@ Gia_Man_t * Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_R
     // clear result and local stats
     Mosh_ResClear( pRes );
     Mosh_BdecStatsClear( &stats );
-    memset( &bestGlobal, 0, sizeof(bestGlobal) );
+    Mosh_BdecCandClear( &bestGlobal );
+    pNew = NULL;
 
     // collect before stats
     pRes->nNodesBefore  = Gia_ManAndNum( pGia );
@@ -850,42 +1214,61 @@ Gia_Man_t * Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_R
         {
             int nLeaves = Vec_IntSize( pBaseWin->vLeaves );
             int fOk;
+            Mosh_BdecCand_t bestDecomp;
 
             Vec_WrdFill( vObjTruths, nObjs, 0 );
             Vec_WrdClear( vOutTruths );
+            Mosh_BdecCandClear( &bestDecomp );
 
             fOk = Mosh_BdecComputeTruths( pGia, pBaseWin, vObjTruths, vOutTruths );
             if ( !fOk )
+            {
+                stats.nWindowsTruthFailed++;
+                if ( pPar->fVerbose && nVerbosePrinted < MOSH_BDEC_TOP_PRINT )
+                {
+                    fprintf( stdout, "moshare (algo bdec): window truth failed  leaves=%d  nodes=%d  outputs=%d\n",
+                        nLeaves,
+                        Vec_IntSize( pBaseWin->vNodes ),
+                        Vec_IntSize( pBaseWin->vOutLits ) );
+                    nVerbosePrinted++;
+                }
                 continue;
+            }
 
             stats.nTruthComputed += Vec_IntSize( pBaseWin->vOutLits );
 
             // Step 5: enumerate two-literal divisors
             {
-                Mosh_BdecEvalDivisors( pBaseWin, vObjTruths, vOutTruths, pPar, &stats, &bestGlobal );
+                pNew = Mosh_BdecEvalDivisors( pGia, pBaseWin, vObjTruths,
+                    vOutTruths, pPar, &stats, &bestGlobal, &bestDecomp );
 
                 // verbose per-window summary (capped)
                 if ( pPar->fVerbose && nVerbosePrinted < MOSH_BDEC_TOP_PRINT )
                 {
-                    fprintf( stdout, "moshare (algo bdec): window #%d  leaves=%d  nodes=%d  outputs=%d  global_best=%d\n",
+                    fprintf( stdout, "moshare (algo bdec): window #%d  leaves=%d  nodes=%d  outputs=%d  global_best=%d  best_dec_outs=%d\n",
                         nVerbosePrinted + 1,
                         nLeaves,
                         Vec_IntSize( pBaseWin->vNodes ),
                         Vec_IntSize( pBaseWin->vOutLits ),
-                        bestGlobal.nScore );
+                        bestGlobal.nScore,
+                        bestDecomp.nDecOutputs );
                     nVerbosePrinted++;
                 }
+                if ( pNew != NULL )
+                    break;
             }
         }
     }
 
     // collect after stats
-    pRes->nNodesAfter   = pRes->nNodesBefore;
-    pRes->nLevelsAfter  = pRes->nLevelsBefore;
+    pRes->nNodesAfter   = pNew ? Gia_ManAndNum( pNew ) : pRes->nNodesBefore;
+    pRes->nLevelsAfter  = pNew ? Gia_ManLevelNum( pNew ) : pRes->nLevelsBefore;
     pRes->nCandidates   = stats.nDivisorsUnique;
-    pRes->nApplied      = 0;
+    pRes->nApplied      = stats.nReplacementAccepted;
     pRes->nPartitions   = stats.nWindowsMultiOutput;
-    pRes->fChanged      = 0;
+    pRes->nRejectedProfit = stats.nRejectedProfit;
+    pRes->nRejectedLevel  = stats.nRejectedLevel;
+    pRes->fChanged      = pNew != NULL;
 
     if ( pPar->fStats )
     {
@@ -906,7 +1289,11 @@ Gia_Man_t * Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_R
         fprintf( stdout, "  operator      = %s\n", bestGlobal.fOr ? "OR" : "AND" );
         fprintf( stdout, "  output hits   = %d\n", bestGlobal.nOutputHits );
         fprintf( stdout, "  support hits  = %d\n", bestGlobal.nSupportHits );
+        fprintf( stdout, "  dec outputs   = %d\n", bestGlobal.nDecOutputs );
         fprintf( stdout, "  existing node = %d\n", bestGlobal.fExisting );
+        if ( bestGlobal.iExistingObj >= 0 )
+            fprintf( stdout, "  existing obj  = %d%s\n", bestGlobal.iExistingObj,
+                bestGlobal.fExistingCompl ? " (compl)" : "" );
         fprintf( stdout, "  score         = %d\n", bestGlobal.nScore );
         fprintf( stdout, "  truth         = 0x%016llx\n", (unsigned long long)bestGlobal.Truth );
     }
@@ -920,7 +1307,7 @@ Gia_Man_t * Mosh_ManPerformAlgoBdec( Gia_Man_t * pGia, Mosh_Par_t * pPar, Mosh_R
     Vec_WrdFree( vObjTruths );
     Vec_WrdFree( vOutTruths );
 
-    return pGia;
+    return pNew != NULL ? pNew : pGia;
 }
 
 ABC_NAMESPACE_IMPL_END
